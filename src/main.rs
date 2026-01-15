@@ -1,587 +1,717 @@
-use clap::{Parser, Subcommand};
-use serde::{Serialize, Deserialize};
-//use serde_yaml::Value;
+#![allow(unused)]
+//use std::fsrust enum set value based on variant;
+use std::env;
+//use std::collections::HashMap;
+//use std::os::unix::fs;
+use std::cmp::Ordering;
+use std::path::Path;
+use std::path::PathBuf;
+use std::io::Write;
+use std::fs::File;
+use std::fs::read_to_string;
 use std::fs;
-//use std::fs::File;
-//use std::io::Write;
+//these two are used to read the alternatives DB, in the future it would be better to write a custom parser, so only the std is used
+use serde_json;
+use serde::{Deserialize, Serialize};
 
-const BUILT_IN_DB_PATH: &str = "/tmp/alts.yaml";
-const DROP_IN_DIR_PATH: &str = "/tmp/dropins";
+enum Message {
+    Debug {message: String},    
+    Info {message: String},    
+    Warning {message: String},    
+    Error {message: String},    
+}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Follower {
-    link: String,
+#[derive(PartialEq,PartialOrd,Debug, Clone)]
+enum Verbosity {
+    Error,
+    Warning,
+    Info,
+    Debug,
+}
+
+#[derive(PartialEq,Debug)]
+enum Errors {
+    Unknown,
+    Unimplemented,
+    EOK,
+    MissingArguments,
+    WrongInstallArguments,
+    WrongRemoveArguments,
+    UnknownArgument,
+    UnknownCommand,
+    UnknownInstallOptionalArgument,
+    MissingFamilyParameter,
+    MissingFollowerParameter,
+    MissingInitScriptParameter,
+    DBPermissions,
+    DBFileNotFound,
+}
+
+#[derive(PartialEq,Debug)]
+enum DbType {
+    Dropin,
+    Cli,
+}
+
+#[derive(PartialEq,Debug,Serialize,Deserialize,Clone)]
+struct Alternative {
+    /*
+     * The alternative struct contains the "header-like" attributes.
+     * The actual file/link/etc names are stored in the Records structs.
+     *
+     * */
     name: String,
-    path: String,
+    identifier: String, //For compatibility reasons, the path of the "leader" is used by default for the cli operations
+    priority: i32,
+    records: Vec<Records>, //theese can be alterantives, initscripts etc
+    //These are for internal use only and should not appear in the resulting db files
+    db_file: Option<PathBuf>,  
+
 }
 
-// Converts the vector of string returned byt the parser to vector of followers.
-// NOTE: Does not check, whether the length of the input is a multiple of 3, the parser should provide an input of the proper length, but some further check here might be appropriate
-fn unwrap_followers(arg: &[String]) -> Vec<Follower> {
-    let mut rv = Vec::new();
-
-    for chunk in arg.chunks(3) {
-        rv.push(Follower {
-            link: chunk[0].clone(),
-            name: chunk[1].clone(),
-            path: chunk[2].clone(),
-        });
+#[derive(PartialEq,Debug,Serialize,Deserialize,Clone)]
+enum Records {
+    File {
+        link: String,
+        name: String,   
+        path: String,
+    },
+    Initscript,
+}
+impl Records {
+    fn to_json (&self) -> String {
+        let mut rv = "".to_string();
+        match &self {
+            Records::File {link,name,path} => {
+                rv.push_str(&format!("      {{\n"));
+                rv.push_str(&format!("        \"File\": {{\n"));
+                rv.push_str(&format!("          \"link\": \"{}\",\n", link)); 
+                rv.push_str(&format!("          \"name\": \"{}\",\n", name));
+                rv.push_str(&format!("          \"path\": \"{}\"\n", path));
+                rv.push_str(&format!("        }}\n"));
+                rv.push_str(&format!("      }}\n"));
+            },
+            _ => {},
+        }
+        return rv;
     }
-    rv
 }
 
+impl PartialOrd for Alternative {
+    // TODO - this might need some more refinement, e.g. should alternatives with diffent names be comparable?
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if (self.priority < other.priority) {
+            return Some(Ordering::Less)
+        } else if (self.priority > other.priority) {
+            return Some(Ordering::Greater)
+        }
+        
+        // The priorities are equal, identifier should now decide
+        // Identifier should be unique among the alternatives with the same name,
+        // the equal branch should thus only be reached when comapring alternatives with different names
+        if (self.identifier < other.identifier) {
+            return Some(Ordering::Less)
+        } else if (self.identifier > other.identifier) {
+            return Some(Ordering::Greater)
+        }
 
-#[derive(Serialize,Deserialize,Debug,Clone)]
-struct WithFollowers {link: String, path: String, priority: i32, followers: Vec<Follower>}
-#[derive(Serialize,Deserialize,Debug,Clone)]
-struct WithoutFollowers {link: String, path: String, priority: i32}
-
-#[derive(Serialize,Deserialize,Debug,Clone)]
-#[serde(untagged)]
-enum Alternative {
-    WithFollowers(WithFollowers),
-    WithoutFollowers(WithoutFollowers),
+        return None;
+        
+    }
 }
 
 impl Alternative {
-    fn get_path (&self) -> &String {
-        match self {
-            Alternative::WithoutFollowers (alt) => return &alt.path,
-            Alternative::WithFollowers (alt) => return &alt.path,
+    fn new (name: String, identifier: String, prio: i32, db_file: Option<PathBuf>) -> Self {
+        Self {
+            name: name,
+            identifier: identifier,
+            priority: prio,
+            records: Vec::new(),
+            db_file: db_file,
         }
     }
 
-    fn get_link (&self) -> &String {
-        match self {
-            Alternative::WithoutFollowers (alt) => return &alt.link,
-            Alternative::WithFollowers (alt) => return &alt.link,
-        }
-    }
+    fn to_json (&self) -> String {
+        let mut rv = "".to_string();
+        rv.push_str(&format!("  {{\n"));
+        rv.push_str(&format!("    \"name\": \"{}\",\n",self.name)); 
+        rv.push_str(&format!("    \"identifier\": \"{}\",\n",self.identifier));
+        rv.push_str(&format!("    \"priority\": {},\n", self.priority));
+        rv.push_str(&format!("    \"records\": [\n"));
 
-    fn get_priority (&self) -> i32 {
-        match self {
-            Alternative::WithoutFollowers (alt) => return alt.priority,
-            Alternative::WithFollowers (alt) => return alt.priority,
-        }
-    }
-
-    fn new (link: String, path: String, priority: i32, followers: Vec<Follower>) -> Alternative {
-        match  followers.len() {
-            0 => return Alternative::WithoutFollowers(WithoutFollowers {link, path, priority}),
-            _ => return Alternative::WithFollowers(WithFollowers {link, path, priority, followers}),
-        }
-    }
-
-    //TODO might need a name parameter too
-    fn create_links (&self) -> Vec<(String,String)> {
-        let mut rv = Vec::new();
-        match self {
-            Alternative::WithoutFollowers (alt) => {
-                rv.push((alt.link.clone(),alt.path.clone())); //TODO change the order of arguments
-            },
-            Alternative::WithFollowers (alt) => {
-                rv.push((alt.link.clone(),alt.path.clone())); //TODO change the order of arguments
-                for follower in &alt.followers {
-                    rv.push((follower.link.clone(),follower.path.clone())); //TODO change the order of arguments
-                }
-
-            },
-        }
-        return rv.clone();
-    }
-}
-
-#[derive(Serialize,Deserialize,Debug,Clone)]
-struct BuiltIn {name: String, mode: String, manualPath: String, alternatives: Vec<Alternative>}
-#[derive(Serialize,Deserialize,Debug,Clone)]
-struct DropIn {name: String, alternatives: Vec<Alternative>}
-
-//This structure contains the header + the vector of alternatives
-#[derive(Serialize,Deserialize,Debug,Clone)]
-#[serde(untagged)]
-enum AlternativeGroup {
-    BuiltIn (BuiltIn),
-    DropIn  (DropIn),
-}
-
-impl AlternativeGroup {
-
-    fn to_builtin (&self) -> AlternativeGroup {
-        match self {
-            AlternativeGroup::DropIn (group) => return AlternativeGroup::BuiltIn(BuiltIn {name : group.name.clone(), mode : "Auto".to_string(), manualPath : "".to_string(),  alternatives : group.alternatives.clone()}),
-            AlternativeGroup::BuiltIn (group) => return AlternativeGroup::BuiltIn(BuiltIn {name : group.name.clone(), mode : group.mode.clone(), manualPath : group.manualPath.clone(), alternatives : group.alternatives.clone()}),
-        }
-    }
-
-    fn to_dropin (&self) -> AlternativeGroup {
-        match self {
-            AlternativeGroup::BuiltIn (group) => return AlternativeGroup::DropIn(DropIn {name : group.name.clone(), alternatives : group.alternatives.clone()}),
-            _ => return self.clone(),
-        }
-    }
-
-    fn new_dropin (name: String, alternatives: Vec<Alternative>) -> AlternativeGroup {
-        return AlternativeGroup::DropIn(DropIn {name, alternatives});
-    }
-
-    fn new_builtin (name: String, alternatives: Vec<Alternative>) -> AlternativeGroup {
-        let aux = AlternativeGroup::new_dropin(name, alternatives);
-        return aux.to_builtin();
-    }
-
-    fn append_alternative (&mut self, alt: Alternative) {
-        match self {
-            AlternativeGroup::DropIn (group) => group.alternatives.push(alt),
-            AlternativeGroup::BuiltIn (group) => group.alternatives.push(alt),
-        }
-    }
-
-    fn remove_alternative (&mut self, path: String) {
-        let mut alternatives = match self {
-            AlternativeGroup::DropIn (group) => &mut group.alternatives,
-            AlternativeGroup::BuiltIn (group) => &mut group.alternatives,
-        };
-        //TODO Later: use extract_if instead -> currently marked as "nightly-only experimental API"
-        //_ = alternatives.extract_if(|x| x.get_path() == path);
-        let mut i = 0;
-        while i < alternatives.len() {
-            if alternatives[i].get_path().clone() == path {
-                _ = alternatives.remove(i);
-            } else {
-                i += 1;
+        let mut comma = false;
+        for rec in &self.records {
+            if comma == true {
+                rv.push_str(&format!("        ,\n")); //TODO -> put the comma on the previous line to make the json a bit prettier
             }
+            rv.push_str(&rec.to_json());
+            comma = true;
         }
 
+        
+        rv.push_str(&format!("    ]\n"));
+        rv.push_str(&format!("  }}\n"));
+        return rv;
+
     }
 
-    fn set_auto_mode (&mut self) {
-        match self {
-            AlternativeGroup::DropIn (_) => {},
-            AlternativeGroup::BuiltIn (ref mut group) => group.mode = "Auto".to_string(),
+    
+    fn uninstall (env: &Settings, name: String, identifier: String) -> Result<(),Errors> {
+        // We need to:
+        // Load the DB
+        // Check, whether the removed alternative has the highest prio
+        // If it does set the new highest alterntive
+        // disable the alternative
+        // update the DB;
+
+        //Read the DB
+        let db_file_name = env.get_db_file_name(&name);
+        print_message(env, Message::Debug{message: format!("Reading db file: {:#?}\n",db_file_name).to_string()});
+        let mut cli_alternatives = read_db_file(env, &db_file_name)?;
+
+        // Find the alternative to be removed
+        let alt = match Alternative::get_alternative(env,&cli_alternatives, &identifier) {
+            None => {return Err(Errors::Unimplemented);}
+            Some(x) => {x}
         };
-    }
+        print_message(env,Message::Debug{message: format!("Found the alternative:{:#?}",alt)});
 
-    fn set_manual_mode (&mut self, path: String) {
-        match self {
-            AlternativeGroup::DropIn (_) => {},
-            AlternativeGroup::BuiltIn (ref mut group) => {
-                group.mode = "Manual".to_string();
-                group.manualPath = path;
-            },
-        };
-    }
+        
 
-    fn get_manual_path (&self) -> String {
-        let rv = match self {
-            AlternativeGroup::DropIn (_) => "".to_string(),
-            AlternativeGroup::BuiltIn (group) => group.manualPath.clone(),
-        };
-        return rv.clone();
-    }
+        //remove it from the loaded db
+        cli_alternatives = cli_alternatives.into_iter().filter(|x| x.identifier != identifier).collect();
+        // Find the highest one in the new DB
+        let highest_cli = Alternative::highest_prio(env, &cli_alternatives).clone();
+        print_message(env,Message::Debug{message: format!("The new highest prio:{:#?}",highest_cli)});
 
-    fn get_mode (&self) -> String {
-        let rv = match self {
-            AlternativeGroup::DropIn (_) => "Auto".to_string(),
-            AlternativeGroup::BuiltIn (group) => group.mode.clone(),
-        };
-        return rv.clone();
-    }
-
-    fn get_name (&self) -> String {
-        let rv = match self {
-            AlternativeGroup::DropIn (group) => &group.name,
-            AlternativeGroup::BuiltIn (group) => &group.name,
-        };
-        return rv.clone();
-    }
-
-    fn get_alternatives (&self) -> Vec<Alternative> {
-        let rv = match self {
-            AlternativeGroup::DropIn (group) => &group.alternatives,
-            AlternativeGroup::BuiltIn (group) => &group.alternatives,
-        };
-        return rv.clone();
-    }
-
-    fn cmp_name (&self, other: &AlternativeGroup) -> bool {
-        return self.get_name() == other.get_name();
-    }
-
-}
-
-
-
-// target/link_name -> same as ln command
-fn create_symlinks (target: String, link_name: String) {
-    //TODO - just debug function for now, no changes to the files on the disk
-    println!("Making link: {:?} -> {:?}",link_name,target);
-
-}
-/*
- *
-# naming based on: https://linux.die.net/man/8/alternatives# generic name for the group/maste symlink
-- name: /usr/bin/editor
-  mode: manual #manual or auto
-# override info for the manual mode
-  manual_path: /usr/bin/emacs
-  group:
-   - path: /usr/bin/vim
-     link: sl_to_vim
-     priority: 10
-     follower:
-       - link: foo1
-         name: foo1
-         path: foo1
-       - link: foo2
-         name: foo2
-         path: foo2
-   - path: /usr/bin/emacs
-     link: sl_to_emacs
-     priority: 9- name: version_control
-  mode: auto
-  manual_path:
-  group:
-  - path: /usr/bin/path
-    link: sl_to_git
-    priority: 100
-  - path: /usr/bin/svn
-    link: sl_to_subversion
-    priority: 10
- *
- *
- */
-
-//Read the content of FS directory and return the read alternatives
-fn read_dropins(path: &String) -> Vec<AlternativeGroup>{
-    let mut rv = Vec::new();
-    for file in fs::read_dir(path).expect("Dir error") {
-        let file_path = file.expect("TODO error").path();
-        let content = fs::read_to_string(file_path).expect("TODO File error");
-        let mut config: Vec<AlternativeGroup> = serde_yaml::from_str(content.as_str()).expect("Parse error");
-        rv.append(&mut config);
-    }
-
-    return rv.iter().map(|x| x.to_dropin()).collect::<Vec<_>>();
-}
-
-/*
- * 1. filter the alternative groups by name
- * 2. if there are multiple alternative groups with a same name, merge them into one
- */
-fn merge_dropins(name: &String, groups: Vec<AlternativeGroup>) -> Option<AlternativeGroup> {
-    let mut rv = AlternativeGroup::new_dropin(name.clone(),Vec::new());
-    let mut found = false;
-    for a_g in groups {
-        if a_g.get_name() == *name {
-            for alt in a_g.get_alternatives() {
-                rv.append_alternative(alt);
-                found = true;
-            }
-        }
-    }
-    if found == true {
-        return Some(rv);
-    }
-    else {
-        return None;
-    }
-}
-
-fn filter_buildins(name: &String, groups: Vec<AlternativeGroup>) -> Option<AlternativeGroup> {
-    for a_g in groups {
-        if a_g.get_name() == *name {
-            return Some(a_g.clone());
-        }
-    }
-    return None;
-}
-
-/*
- * Returns the alternative with highest priority (Return it as a single element vector)
- * If the list of alternatives is empty returns none
- * Undefined behavior when there are multiple alternatives with the same prio
- */
-fn highest_prio(alts: &Vec<Alternative>) -> Option<&Alternative> {
-    if let Some ((head, tail)) = alts.split_first() {
-        let mut rv = head;
-        for alt in tail {
-            if alt.get_priority() >= rv.get_priority(){
-                if alt.get_priority() == rv.get_priority(){
-                    //TODO print warning
-                } else {
-                    rv = alt;
-                }
-            }
-        }
-        return Some(rv);
-    } else {
-        return None;
-    }
-}
-
-fn manual_prio(alts: &Vec<Alternative>, path: String) -> Option<&Alternative>{
-    for alt in alts {
-        if *alt.get_path() == path {
-            return Some(alt);
-        }
-    }
-    return None;
-}
-
-/*
- * This is a top level function that deals with symlink updates for an alternative group set to auto
- * 1. read the config files, if there's no match in hte builtin file, create a new alternative group
- *
- */
-fn update_links (name: &String, buildins_path: &String, dropins_path: &String) {
-    let builtins = filter_buildins(name, read_config(buildins_path));
-    let dropins = merge_dropins(name, read_dropins(dropins_path));
-    match builtins {
-        None => {panic!("Reached the unreachable!");} //This should be unreachable branch
-        Some(builtin) => {
-            let mut alternatives = builtin.get_alternatives();
-            if let Some(dropins) = dropins { // are there any dropins?
-                alternatives.append(&mut dropins.get_alternatives()); //append them
-            }
-            println!("List of all alternatives (Builtins + dropins): {:?}",alternatives); //TODO debug text
-            let best_alt: Option<&Alternative> = if builtin.get_mode().to_lowercase() == "auto".to_string() {
-                // group is in auto mode
-                 highest_prio(&alternatives)
+        // Write the new DB
+        print_message(env,Message::Debug{message: format!("The new vector of alternatives: {:#?}\n",&cli_alternatives)});
+        if highest_cli == None {
+            // There are no alternatives left -> just remove the file
+            if (alt.db_file == None) {               
             }
             else {
-                // Group is in the manual mode
-                manual_prio(&alternatives, builtin.get_manual_path())
+                remove_db_file(env,alt.db_file.clone().unwrap())?
             };
-            for (fst,snd) in best_alt.expect("No alternative found for the alternative group").create_links() {
-                create_symlinks(fst,snd);
+        } else {
+            //there're still some alternatives
+            write_db_file(env, &cli_alternatives)?;
+        }
+
+        Alternative::check_conflicts(); //TODO: unimplemented
+
+        match highest_cli {
+            None => {
+                for record in alt.records {
+                    disable_record(env, &record )?; // TODO make sure these are full paths 
+                }
+            } // No remaining alternatives -- disabel this one
+            Some(h) if h > alt => {} // Wasn't the highest -- no updates
+            Some(h) => {//Was the highest
+                for record in alt.records {
+                    disable_record(env, &record )?; // TODO make sure these are full paths 
+                }
+                for record in h.records {
+                    enable_record(env, &record )?; // TODO make sure these are full paths 
+                }
+            }
+        }
+
+        
+
+        return Ok(());
+    }
+    
+    fn install (&self,env: &Settings) -> Result<(),Errors> {
+        let db_file_name = env.get_db_file_name(&self.name);
+
+        print_message(env, Message::Debug{message: format!("Reading db file: {:#?}\n",db_file_name).to_string()});
+        let mut cli_alternatives = match read_db_file(env, &db_file_name) {
+            Ok(alt) => {alt}
+            _ => {Vec::new()}
+        };
+        // For now, the dropin files should support only import/export to/from the main databese.
+        // In the future a separate cli and dropin database directories might be implented
+        
+        Alternative::check_conflicts(); //TODO: unimplemented
+
+        let highest_cli = Alternative::highest_prio(env, &cli_alternatives).clone();
+        print_message(env,Message::Debug{message: format!("The highest cli prio: {:#?}\n",highest_cli)});
+
+        //update the DB
+        cli_alternatives.push(self.clone());
+        print_message(env,Message::Debug{message: format!("The new vector of alternatives: {:#?}\n",&cli_alternatives)});
+        write_db_file(env, &cli_alternatives);
+
+        match highest_cli {
+            // The simplest case -> we only need to add the new alternative to the DB, no links shall be modified
+            Some(h) if &h >= self => {
+                //Nothing ot do
+            }
+            // The new alternative has highest priority -> we need to add it to the db + update the links. There are two subcase:
+            // There was some alternative before or...
+            Some(h) => {
+                // Disable the previous alternative
+                for record in &h.records {
+                    disable_record(env, &record )?; // TODO make sure these are full paths 
+                }
+
+                // And enable the new one
+                for record in &self.records {
+                    enable_record(env, &record)?;
+                }
+            }
+            // ...this is the first alternative of its name
+            None => {
+                // And enable the new one
+                for record in &self.records {
+                    enable_record(env, &record)?;
+                }
+            }
+        }
+            
+        
+        return Ok(());
+    }
+
+    fn dropin_import (env: &Settings, path: PathBuf) -> Errors {
+        return Errors::Unimplemented;
+    }
+
+    fn dropin_remove (env: &Settings, path: PathBuf) -> Errors {
+        return Errors::Unimplemented;
+    }
+    
+    fn get_alternative (env: &Settings,alts: &Vec<Alternative>, identifier: &String) -> Option<Alternative> {
+        for alt in alts {
+            if alt.identifier == *identifier {
+                return Some(alt.clone());
+            }
+        }     
+        return None;
+    }
+
+    fn highest_prio (env: &Settings, alts: &Vec<Alternative>) -> Option<Alternative> {
+        let mut rv = None;
+        for alt in alts {
+            match rv {
+                None => {rv = Some(alt.clone())}
+                Some(h) if *alt > h => {rv = Some(alt.clone())}
+                _ => {}
+            }
+        }
+        return rv;
+    }
+    
+    fn check_conflicts () {}
+}
+
+#[derive(PartialEq,Debug)]
+enum Command {
+    Install{alternative: Alternative},
+    Remove{name: String, path: String},
+    Auto{name: String},
+    Help,
+    None,
+}
+
+
+fn enable_record (env: &Settings, rec: &Records) -> Result<(),Errors> {
+    match rec {
+        Records::File{link, name, path} => {
+            print_message(env, Message::Info{message: format!("Linking: {:#?} -> {:#?}\n",link,name).to_string()});
+            if env.dry_run == false {
+                //TODO -> the actual fs operation
             }
 
+            print_message(env, Message::Info{message: format!("Linking: {:#?} -> {:#?}\n",name,path).to_string()});
+            if env.dry_run == false {
+                //TODO -> the actual fs operation
+            }
+            return Ok(());
         }
+        _ => {
+            print_message(env, Message::Error{message: format!("This operation is not yet implemented!\n").to_string()});
+            return Err(Errors::Unimplemented);
+            
+        }
+    }    
+}
+
+fn disable_record (env: &Settings, rec: &Records) -> Result<(),Errors> {
+    match rec {
+        Records::File{link, name, path} => {
+            print_message(env, Message::Info{message: format!("Unlinking: {:#?}",link).to_string()});
+            if env.dry_run == false {
+                //TODO -> the actual fs operation
+            }
+
+            print_message(env, Message::Info{message: format!("Unlinking: {:#?}",name).to_string()});
+            if env.dry_run == false {
+                //TODO -> the actual fs operation
+            }
+            return Ok(());
+        }
+        _ => {
+            print_message(env, Message::Error{message: format!("This operation is not yet implemented!\n").to_string()});
+            return Err(Errors::Unimplemented);
+            
+        }
+    }    
+}
+
+
+fn print_help() {
+    println!("Help Message:") ;
+
+}
+
+
+fn print_message (env: &Settings, mes: Message) {
+    match mes {
+           Message::Error{message} => {
+                if env.verbosity >= Verbosity::Error {
+                    let mes: String = message.lines().map(|x| format!("Error: {}\n",x)).collect();
+                    println!("{}",mes);
+                }
+            }
+            Message::Warning{message} => {
+                if env.verbosity >= Verbosity::Warning {
+                    let mes: String = message.lines().map(|x| format!("Warning: {}\n",x)).collect();
+                    println!("{}",mes);
+                }
+            }
+            Message::Info{message} => {
+                if env.verbosity >= Verbosity::Info {
+                    let mes: String = message.lines().map(|x| format!("Info: {}\n",x)).collect();
+                    println!("{}",mes);
+                }
+            }
+            Message::Debug{message} => {
+                if env.verbosity >= Verbosity::Debug {
+                    let mes: String = message.lines().map(|x| format!("Debug: {}\n",x)).collect();
+                    println!("{}",mes);
+                }
+            }
+        }
+}
+
+fn alts_to_json (env: &Settings, alts: &Vec<Alternative>) -> String {
+    
+    let mut content = "".to_string();
+    content.push_str(&format!("[\n"));
+    let mut comma = false;
+    for alt in alts {
+        if comma == true {
+            content.push_str(&format!("        ,\n")); //TODO -> put the comma on the previous line to make the json a bit prettier
+        }
+        content.push_str(alt.to_json().as_str());
+        comma = true;
+    }
+    content.push_str(&format!("]\n"));
+    return content;
+}
+
+// Check the db directory and get a list of all .json files there
+fn list_db_files (env: &Settings, path_name: PathBuf) -> Result<Vec<PathBuf>,Errors> {
+
+    print_message(env,Message::Debug{message: format!("Setting path to: {:#?}",path_name)});
+
+    let dir_path = Path::new(&path_name);
+    let entries = match fs::read_dir(dir_path) {
+        Ok(entries)  => {entries}
+        Err(why) => {return Err(Errors::Unimplemented);}
+    };
+
+    // Filter out all entries with the wrong extension
+    // TODO Depending on how we want to recover from possible errors, this might be simplified by using collect()
+    // For now we try to handle each error individualy 
+    let mut rv = Vec::new();
+    for entry in entries {
+       print_message(env,Message::Debug{message: format!("Checking entry: {:#?}",entry)});
+       match entry {
+           Ok(ref e) => {
+               match (e.path().extension()) {
+                   None => { //skip this entry
+                           print_message(env,Message::Debug{message: format!("Skipping entry: {:#?}",entry)});
+                   }
+                   Some(ext) => {
+                       print_message(env,Message::Debug{message: format!("Extension: {:#?}",ext)});
+                       if (ext =="json") {
+                           print_message(env,Message::Debug{message: format!("Adding path: {:#?}",e.path())});
+                           rv.push(e.path());
+                       }
+                   }
+               }
+           }
+           Err(why) => {
+               print_message(env,Message::Error{message: format!("Error: {:#?}",why)});//TODO
+               return Err(Errors::Unimplemented);
+           }
+       } 
+    }
+    return Ok(rv);
+}
+
+fn read_db_file (env: &Settings, file_name: &PathBuf) -> Result<Vec<Alternative>,Errors> {
+    let mut rv: Vec<Alternative> = Vec::new();
+    //TODO consider the buffered approach https://doc.rust-lang.org/rust-by-example/std_misc/file/read_lines.html 
+    let f = match read_to_string(file_name) {
+        
+        Ok(file) => {file}
+        #[allow(non_snake_case)] //TODO check this
+        NotFound => {
+            print_message(env,Message::Info{message: format!("DB file not found:{:#?}",file_name)});
+            return Err(Errors::DBFileNotFound);
+        }
+        #[allow(non_snake_case)] //TODO check this
+        PermissionDenied => {
+            print_message(env,Message::Error{message: format!("File permissions error:{:#?}",file_name)});
+            return Err(Errors::DBPermissions);
+        }
+        _ =>  {return Err(Errors::Unknown);}
+
+    };
+    
+    match serde_json::from_str(&f) {
+        Err(why) => {dbg!(why); return Err(Errors::Unknown);}
+        Ok(alts) => {rv = alts;}
+    };
+    for alt in rv.iter_mut() {
+        alt.db_file = Some(file_name.clone());
+    }
+
+    print_message(env,Message::Debug{message: format!("Read DB file:\n{:#?}",rv)});
+    return Ok(rv);
+}
+
+fn remove_db_file(env: &Settings, path: PathBuf) -> Result<(),Errors> {
+
+    print_message(env,Message::Debug{message: format!("Removing File:{:#?}",path)});
+    match fs::remove_file(path) {
+            Ok(_) => {return Ok(())}
+            _ => {return Err(Errors::Unimplemented)}
     }
 }
 
-//reads a single DB file and returns a list of of structs for each NAME entry
-fn read_config(path: &String) -> Vec<AlternativeGroup> {
-    let content = fs::read_to_string(path).expect("File error");
-    let rv: Vec<AlternativeGroup> = serde_yaml::from_str(content.as_str()).expect("Parse error");
-    return rv;
-}
-
-fn write_config(path: &String, content: Vec<AlternativeGroup>) -> std::io::Result<()>{
-    let yaml = serde_yaml::to_string(&content).expect("Parsing error");
-    fs::write(path,yaml.as_bytes()).expect("Writing to file");
-    Ok(())
-}
-
-struct ConfigFile {
-    path: String,
-    content: Vec<AlternativeGroup>,
-    modified: bool
-}
-
-//TODO unused function?
-fn write_db (files: Vec<ConfigFile>) -> std::io::Result<()> {
-    for file in files {
-        if file.modified == true {
-            write_config (&file.path, file.content);
-        }
-    }
-    Ok(())
-
-}
-
-
-//Based on https://linux.die.net/man/8/alternatives
-// TODO add aliases for some now obsolete commands
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// TODO: Help text goes here
-    #[command(long_flag = "install")]
-    Install {
-        /// TODO: Help text goes here
-        link: String,
-        /// TODO: Help text goes here
-        name: String,
-        /// TODO: Help text goes here
-        path: String,
-        /// TODO: Help text goes here
-        priority: i32,
-        /// TODO: Help text goes here
-        #[arg(long, num_args=3, alias="slave", value_names=["LINK", "NAME", "PATH"])]
-        follower: Vec<String>,
-        /// TODO: Help text goes here
-        initscript: Option<String>,
-    },
-    /// TODO: Help text goes here
-    #[command(long_flag = "remove")]
-    Remove { name: String, path: String },
-    /// TODO: Help text goes here
-    #[command(long_flag = "set")]
-    Set { name: String, path: String },
-    /// TODO: Help text goes here
-    #[command(long_flag = "auto")]
-    Auto { name: String },
-    /// TODO: Help text goes here
-    #[command(long_flag = "display")]
-    Display { name: String },
-    /// TODO: Help text goes here
-    #[command(long_flag = "config")]
-    Config { name: String },
-}
-
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Arguments {
+fn write_db_file(env: &Settings, alts: &Vec<Alternative>) -> Result<(),Errors> {
     /*
-     * Common Options
+     * The function expects that all the alternatives are to be written to the same file (determined by the first aternative in the list)
      */
-    /// Generate more comments about what alternatives is doing.
-    #[arg[long]]
-    verbose: bool,
+    if alts.is_empty() {
+        return Ok(());
+    }
 
-    /// Don't generate any comments unless errors occur. This option is not yet implemented.
-    #[arg[long]]
-    quiet: bool,
+    let file_name;
+    if let Some(f) = &alts.first().unwrap().db_file {
+        file_name = f.clone();
+    }
+    else {
+        return Err(Errors::Unknown);
+    };
 
-    /// Don't actually do anything, just say what would be done. This option is not yet implemented.
-    #[arg[long]]
-    test: bool,
+    /*
+     * TODO: backup the original file
+     */
 
-    /// Specifies the alternatives directory, when this is to be different from the default.
-    #[arg(long, value_name = "alt_dir")]
-    altdir: Option<String>,
+    let path = file_name.as_path();
 
-    /// Specifies the administrative directory, when this is to be different from the default.
-    #[arg(long, value_name = "admin_dir")]
-    admindir: Option<String>,
+    
+    print_message(env,Message::Info{message: format!("Updating file {:#?}",file_name)});
 
-    #[command(subcommand)]
-    command: Commands,
+    let content = alts_to_json(&env, alts);
+    if env.dry_run == false {
+        let mut file = match File::create(&path) {
+            Err(why) => return Err(Errors::Unknown),
+            Ok(file) => file,
+        };
+        print_message(env,Message::Debug{message: format!("Writing:\n{}\n",content)});
+        match file.write_all(content.as_bytes()) {
+            Err(why) => return Err(Errors::Unknown),
+            Ok(_) => {},
+        }
+    } else {
+        print_message(env,Message::Debug{message: format!("Writing:\n{}\n",content)});
+    }
+
+    return Ok(());
 }
+
+#[derive(Clone,Debug)]
+pub struct Settings {
+    verbosity: Verbosity,
+    dry_run: bool,
+    path_prefix: String,
+    admin_dir: String,
+    alternatives_dir: String,
+}
+
+impl Default for Settings {
+    fn default () -> Self {
+        Settings {
+            verbosity: Verbosity::Warning,
+            dry_run: true,
+            path_prefix: "".to_string(),
+            admin_dir: "/tmp".to_string(),
+            alternatives_dir: "/tmp".to_string(),
+        }    
+    }
+}
+
+impl Settings {
+    fn get_db_cli_dir (&self) -> PathBuf {
+       return PathBuf::from(format!("{}/cli/",self.admin_dir)); 
+    }
+    
+    fn get_db_file_name (&self,alt: &String) -> PathBuf {
+       return PathBuf::from(format!("{}/cli/{}.json",self.admin_dir,alt)); 
+       //return format!("{}/cli/{}.json",self.admin_dir,alt); 
+    }
+
+    fn parse_args (args: Vec<String>) -> Result<(Command, Settings),Errors> {
+
+        let mut rv_command = Command::None;
+        let mut rv_settings: Settings = Default::default();
+        if args.len() == 1 {
+            return Err(Errors::MissingArguments);
+        }
+        /*
+         * Lets deal with the common options first, when done, i should be the index of the command
+         */
+        let mut i = 1;
+        loop {
+            if i == args.len() {
+                    return Err(Errors::UnknownArgument);
+            }
+            match args[i].as_str() {
+                //TODO: use the --verbosit=foo syntax instead
+                    "--debug"  => {rv_settings.verbosity = Verbosity::Debug}
+                    "--verbose"  => {rv_settings.verbosity = Verbosity::Info}
+                    "--dry-run"  => {rv_settings.dry_run = true}
+                    "--no-dry-run"  => {rv_settings.dry_run = false}
+                    "--install"  => {break;}
+                    "--remove"  => {break;}
+
+                    _ => {return Err(Errors::UnknownArgument);}
+            }
+            i += 1;
+            
+        }
+        //the previous loop ended at one of the commands:
+        match args[i].as_str() {
+            "--remove" => {
+                if let Some(_prio) = args.get(i+2) {
+                    let rv_command = Command::Remove{
+                        name: args[i+1].clone(),
+                        path: args[i+2].clone(),
+                    };
+                    return Ok((rv_command,rv_settings.clone()));
+                }
+                else {
+                   return Err(Errors::WrongRemoveArguments);
+                }
+            }
+            "--install" => {
+                let mut alternative;// = Alternative::new();
+                //Check whether there are at least 4 more arguments (the 4th one is the priority)
+                if let Some(_prio) = args.get(i+4) {
+                    
+                    alternative = Alternative::new(
+                        args[i+2].clone(),
+                        args[i+3].clone(),
+                        _prio.parse().unwrap(),
+                        Some(PathBuf::from(format!("{}/cli/{}.json",rv_settings.admin_dir,args[i+2]))), //TODO use a function instead
+                    );
+
+                    alternative.records.push(Records::File {                    
+                        link: args[i+1].clone(),
+                        name: args[i+2].clone(),
+                        path: args[i+3].clone(),
+                    });
+
+                    i += 5;
+                } else {
+                    return Err(Errors::WrongInstallArguments);
+                }
+                //check for the optional arguments (followers etc.)
+                loop {
+                    if let Some(_optional) = args.get(i) {
+                        match _optional.as_str() {
+                            "--follower" | "--slave" => {
+                                if let Some(_path) = args.get(i+3){
+
+                                    alternative.records.push(Records::File {                    
+                                        link: args[i+1].clone(),
+                                        name: args[i+2].clone(),
+                                        path: args[i+3].clone(),
+                                    });
+                                    i += 4;
+                                }
+                                else {
+                                    {return Err(Errors::MissingFollowerParameter);}
+                                }
+                            }
+                            "--initscript" => {
+                                if let Some(_script) = args.get(i+1){
+                                    alternative.records.push(Records::Initscript); //TODO
+                                    i += 2;
+                                }
+                                else {
+                                    {return Err(Errors::MissingInitScriptParameter);}
+                                }
+                            }
+                            "--family" => {
+                                if let Some(_fam) = args.get(i+1){
+                                    //TODO
+                                    i += 2;
+                                }
+                                else {
+                                    {return Err(Errors::MissingFamilyParameter);}
+                                }
+                            }
+                                _ => {return Err(Errors::UnknownInstallOptionalArgument);}
+                        }
+                    
+                    }
+                    //no more arguments
+                    else {
+                        break;
+                    }
+                }
+                rv_command = Command::Install{alternative: alternative};
+                return Ok((rv_command,rv_settings.clone()));
+
+            }
+            _ => {return Err(Errors::UnknownCommand);}
+        }
+    }
+}
+
 
 fn main() {
-    let cli = Arguments::parse();
-
-    match cli.command {
-        Commands::Install {
-            ref link,
-            ref name,
-            ref path,
-            ref priority,
-            ref follower,
-            ref initscript,
-        } => {
-            /*
-             * 1. Parse the arguments
-             * 2. Read the builtin DB file
-             * 3. Append new alternative to the builtin DB file
-             * 4. Write the modified DB file, if the the alternative group is set to manual then end else:
-             * 5. Run the quivalent of the AUTO branch
-             */
-            //Parse the arguments
-            let followers = unwrap_followers(follower);
-            let alt = Alternative::new(link.to_string(),path.to_string(),*priority,followers);
-            //Read the bultin DB file
-            let mut built_in_db = read_config(&BUILT_IN_DB_PATH.to_string());
-            //Find the correct alternative group
-
-            let mut done = false;
-
-            // check whether the alternative group with given name already exists and update it
-            // Maybe TODO check for duplicit entries in the same alternative group
-            for a_g in &mut built_in_db {
-                if a_g.get_name() == name.to_string() {
-                    a_g.append_alternative (alt.clone());
-                    done = true;
-                    break;
-                }
-            }
-
-            // this is a new alternative group = create it and append it
-            if done == false {
-                let new_alt_group = AlternativeGroup::new_builtin(name.to_string(), [alt.clone()].to_vec());
-                built_in_db.push(new_alt_group);
-            }
-
-            write_config(&BUILT_IN_DB_PATH.to_string(),built_in_db);
-            // if the alternative group is se to auto - check the priorites and update the symlinks
-            update_links(name, &BUILT_IN_DB_PATH.to_string(), &DROP_IN_DIR_PATH.to_string());
+    let args: Vec<String> = env::args().collect();
+    let mut env: Settings = Settings::default();
+    
+    let (command, env) = match Settings::parse_args(args) {
+        Ok ((c,e)) => {(c,e)}
+        Err (why) => {
+            dbg!(why);
+            panic!();
         }
-        Commands::Display {
-            ref name,
-        } => {
-            let builtins = read_config(&BUILT_IN_DB_PATH.to_string());
-            println!("Built ins:\n {:?}", filter_buildins(name, builtins));
-            let dropins = read_dropins(&DROP_IN_DIR_PATH.to_string());
-            println!("Drop ins:\n {:?}", merge_dropins(name, dropins));
-        }
-        Commands::Auto { ref name} => {
-            let mut built_in_db = read_config(&BUILT_IN_DB_PATH.to_string());
-            for a_g in &mut built_in_db {
-                if a_g.get_name() == name.to_string() {
-                    a_g.set_auto_mode();
-                }
-            }
-            write_config(&BUILT_IN_DB_PATH.to_string(),built_in_db);
-
-            update_links(name, &BUILT_IN_DB_PATH.to_string(), &DROP_IN_DIR_PATH.to_string());
-        }
-        Commands::Set { ref name, ref path} => {
-            let mut built_in_db = read_config(&BUILT_IN_DB_PATH.to_string());
-            for a_g in &mut built_in_db {
-                if a_g.get_name() == name.to_string() {
-                    a_g.set_manual_mode(path.clone());
-                }
-            }
-            write_config(&BUILT_IN_DB_PATH.to_string(),built_in_db);
-
-            update_links(name, &BUILT_IN_DB_PATH.to_string(), &DROP_IN_DIR_PATH.to_string());
-        }
-        Commands::Remove { ref name, ref path } => {
-            let mut built_in_db = read_config(&BUILT_IN_DB_PATH.to_string());
-
-            for a_g in &mut built_in_db {
-                if a_g.get_name() == name.to_string() {
-                    a_g.remove_alternative (path.clone());
-                }
-            }
-            write_config(&BUILT_IN_DB_PATH.to_string(),built_in_db);
-            update_links(name, &BUILT_IN_DB_PATH.to_string(), &DROP_IN_DIR_PATH.to_string());
-
-        }
-        _ => println!("We've got a problem"),
     };
-}
+    let rv = match command {
+        Command::Install{alternative} => {
+            let ops = alternative.install(&env);
+            Errors::EOK
+        }
+        Command::Remove{name, path} => {
+            let ops = Alternative::uninstall(&env,name,path);
+            Errors::EOK
+        }
+        _ => {
+            
+            Errors::Unimplemented
+        }
+    };
 
-// TODO: more tests!
-#[cfg(test)]
-pub mod cli {
-    use super::*;
-    use clap::CommandFactory;
-
-    #[test]
-    #[ignore = "FIXME"]
-    fn arg_debug_assert() {
-        Arguments::command().debug_assert();
-    }
-
-    #[test]
-    #[ignore = "FIXME"]
-    fn arg_test() {
-        let testing_vec: Vec<_> = "--test".split(" ").collect();
-        let cli = Arguments::command()
-            .no_binary_name(true)
-            .get_matches_from(testing_vec);
-        assert_eq!(cli.get_flag("test"), true);
-    }
-
-    #[test]
-    #[ignore = "FIXME"]
-    fn arg_install() {
-        let testing_vec: Vec<_> = "--install link name path prio".split(" ").collect();
-        let cli = Arguments::command()
-            .no_binary_name(true)
-            .get_matches_from(testing_vec);
-        assert!(cli.contains_id("install"));
-    }
 }
