@@ -37,6 +37,8 @@ enum Errors {
     MissingArguments,
     WrongInstallArguments,
     WrongRemoveArguments,
+    WrongExportArguments,
+    WrongImportArguments,
     UnknownArgument,
     UnknownCommand,
     UnknownInstallOptionalArgument,
@@ -45,6 +47,7 @@ enum Errors {
     MissingInitScriptParameter,
     DBPermissions,
     DBFileNotFound,
+    AlternativeAlreadyExists,
 }
 
 #[derive(PartialEq,Debug)]
@@ -174,7 +177,7 @@ impl Alternative {
             None => {return Err(Errors::Unimplemented);}
             Some(x) => {x}
         };
-        print_message(env,Message::Debug{message: format!("Found the alternative:{:#?}",alt)});
+        print_message(env,Message::Debug{message: format!("Found the alternative:\n{:#?}",alt)});
 
         
 
@@ -198,7 +201,6 @@ impl Alternative {
             write_db_file(env, &cli_alternatives)?;
         }
 
-        Alternative::check_conflicts(); //TODO: unimplemented
 
         match highest_cli {
             None => {
@@ -221,8 +223,17 @@ impl Alternative {
 
         return Ok(());
     }
-    
+
+    /*
+     * This function is THE function for installation of a new alterantive
+     * It is among other responsible for:
+     * - checking the DB files for conflicts
+     * - updating the DB files
+     * - removing the symlink obsolated by the installed alternative
+     * - creating the new symlinks
+     * */
     fn install (&self,env: &Settings) -> Result<(),Errors> {
+        // Open the DB file, the file path name si based on the alternative name
         let db_file_name = env.get_db_file_name(&self.name);
 
         print_message(env, Message::Debug{message: format!("Reading db file: {:#?}\n",db_file_name).to_string()});
@@ -230,11 +241,13 @@ impl Alternative {
             Ok(alt) => {alt}
             _ => {Vec::new()}
         };
-        // For now, the dropin files should support only import/export to/from the main databese.
-        // In the future a separate cli and dropin database directories might be implented
-        
-        Alternative::check_conflicts(); //TODO: unimplemented
 
+        // Check for possible conflicts
+        // Important: the alternative's name and identifier combination must be unique
+        // Less important: multiple alterantives (mostly via followers) managing overlapping set of symlinks //TODO NOT IMPLEMNTED
+        self.check_conflicts(env, &cli_alternatives)?; //Abort the installation in case of errors
+
+        //Find an existing alternative with the highest priority
         let highest_cli = Alternative::highest_prio(env, &cli_alternatives).clone();
         print_message(env,Message::Debug{message: format!("The highest cli prio: {:#?}\n",highest_cli)});
 
@@ -243,6 +256,7 @@ impl Alternative {
         print_message(env,Message::Debug{message: format!("The new vector of alternatives: {:#?}\n",&cli_alternatives)});
         write_db_file(env, &cli_alternatives);
 
+        // Update the symlinks        
         match highest_cli {
             // The simplest case -> we only need to add the new alternative to the DB, no links shall be modified
             Some(h) if &h >= self => {
@@ -269,17 +283,58 @@ impl Alternative {
                 }
             }
         }
-            
+        return Ok(());
+    }
+
+    // Input: a json file (using the alternatives structure) containing a vector of alternatives
+    // This function the installs all the alternatives from the input file
+    // This should proabably be done in two passes
+    // - first do a dry run, if it ends up with some fatal errors, jsut abort
+    // - second run -> just call the install method
+    fn dropin_import (env: &Settings, path: PathBuf) -> Result<(),Errors> {
+        // First check for possible conflicts, withouy actually installing anything
+        let mut drop_in = read_db_file (env, &path)?;
+        for alt in &drop_in {
+            // TODO do the checks before actually intalling anything
+        }
+
+        // Now just call the install method for each alternative
+        for alt in &mut drop_in {
+            let db_file_name = env.get_db_file_name(&alt.name);
+            alt.db_file = Some(db_file_name);
+            alt.install(env);
+        }
         
         return Ok(());
     }
 
-    fn dropin_import (env: &Settings, path: PathBuf) -> Errors {
+    // Reverse function to the dropin_import - uninstall the alternatives specified in the input file (path)
+    // TODO add an option for more complex identity checks, right now only name and identifier are used. An option to compare all the fields might be useful
+    fn dropin_remove (env: &Settings, path: PathBuf) -> Errors {
         return Errors::Unimplemented;
     }
 
-    fn dropin_remove (env: &Settings, path: PathBuf) -> Errors {
-        return Errors::Unimplemented;
+    // Prints the alternatives specified by the alts argument in the json format
+    // The DB files/symlinks remain unchanged
+    fn export_alternatives (env: &Settings,alts: Vec<(String/*alternative*/,String/*identifier*/)>) -> Result<(),Errors> {
+        let mut exported_alts: Vec<Alternative> = vec![];
+        for (alt,id) in alts {
+            print_message(env,Message::Debug{message: format!("Processing: {:#?}:{:#?}\n",alt,id)});
+            let db_file_name = env.get_db_file_name(&alt);
+            let mut cli_alternatives = read_db_file(env, &db_file_name)?; // TODO should a nonexistant alternative be a fatal error?
+            match cli_alternatives.into_iter().find(|x| x.identifier == id) {
+                None => {
+                    print_message(env,Message::Debug{message: format!("Alternative: {:#?}:{:#?} not found\n",alt,id)});
+                }
+                Some(a) => {
+                    print_message(env,Message::Debug{message: format!("Alternative found: {:#?}:{:#?}\n{:#?}",alt,id,a)});
+                    exported_alts.push(a.clone());
+                }
+            } 
+            
+        }
+        print!("{}",alts_to_json(env, &exported_alts));
+        return Ok(());
     }
     
     fn get_alternative (env: &Settings,alts: &Vec<Alternative>, identifier: &String) -> Option<Alternative> {
@@ -303,14 +358,32 @@ impl Alternative {
         return rv;
     }
     
-    fn check_conflicts () {}
+    fn check_conflicts (&self, env: &Settings, alts: &Vec<Alternative>) -> Result<(),Errors> {
+        // The simplest check -> make sure the name/identifier combination is unique. (Fatal error if not)
+        // TODO add argument that would allow overwriting and downgrade this to a warning/info messages
+        let dupl_alternatives: Vec<_> = alts.into_iter().filter(|x| x.identifier == self.identifier && x.name == self.name).collect();
+        if dupl_alternatives.is_empty() == false {
+            for dupl in dupl_alternatives {
+                print_message(env,Message::Error{message: format!("The specified alternative already exists! (Use the \"info\" verbosity level for more details)\n")});
+                print_message(env,Message::Info{message: format!("The existing alternative:\n{:#?}",dupl)});
+            }
+            return Err(Errors::AlternativeAlreadyExists);
+        }
+
+        //TODO: check for the same symlink being modified by multiple alternatives 
+
+        return Ok(())        
+    }
 }
 
 #[derive(PartialEq,Debug)]
 enum Command {
     Install{alternative: Alternative},
+    InstallExport{alternative: Alternative},
     Remove{name: String, path: String},
     Auto{name: String},
+    Export{alternatives: Vec<(String,String)>},
+    Import{paths: Vec<PathBuf>},
     Help,
     None,
 }
@@ -319,12 +392,12 @@ enum Command {
 fn enable_record (env: &Settings, rec: &Records) -> Result<(),Errors> {
     match rec {
         Records::File{link, name, path} => {
-            print_message(env, Message::Info{message: format!("Linking: {:#?} -> {:#?}\n",link,name).to_string()});
+            print_message(env, Message::Info{message: format!("Linking: {:#?} -> {:#?}",link,name).to_string()});
             if env.dry_run == false {
                 //TODO -> the actual fs operation
             }
 
-            print_message(env, Message::Info{message: format!("Linking: {:#?} -> {:#?}\n",name,path).to_string()});
+            print_message(env, Message::Info{message: format!("Linking: {:#?} -> {:#?}",name,path).to_string()});
             if env.dry_run == false {
                 //TODO -> the actual fs operation
             }
@@ -526,9 +599,11 @@ fn write_db_file(env: &Settings, alts: &Vec<Alternative>) -> Result<(),Errors> {
             Ok(file) => file,
         };
         print_message(env,Message::Debug{message: format!("Writing:\n{}\n",content)});
-        match file.write_all(content.as_bytes()) {
-            Err(why) => return Err(Errors::Unknown),
-            Ok(_) => {},
+        if env.dry_run == false {
+            match file.write_all(content.as_bytes()) {
+                Err(why) => return Err(Errors::Unknown),
+                Ok(_) => {},
+            }
         }
     } else {
         print_message(env,Message::Debug{message: format!("Writing:\n{}\n",content)});
@@ -585,12 +660,24 @@ impl Settings {
             }
             match args[i].as_str() {
                 //TODO: use the --verbosit=foo syntax instead
-                    "--debug"  => {rv_settings.verbosity = Verbosity::Debug}
-                    "--verbose"  => {rv_settings.verbosity = Verbosity::Info}
-                    "--dry-run"  => {rv_settings.dry_run = true}
-                    "--no-dry-run"  => {rv_settings.dry_run = false}
-                    "--install"  => {break;}
-                    "--remove"  => {break;}
+                "--debug"  => {rv_settings.verbosity = Verbosity::Debug}
+                //TODO: use the --verbosit=foo syntax instead
+                "--verbose"  => {rv_settings.verbosity = Verbosity::Info}
+                "--dry-run"  => {rv_settings.dry_run = true}
+                "--no-dry-run"  => {rv_settings.dry_run = false}
+                /*
+                 * The commnands start here, we've already read the common options, so the command specific parsing should be doen next -> breaking the initial loop
+                 */
+                "--install"  => {break;}
+                "--install-batch"  => {break;} // installs from the given json file
+                "--import" => {break;} // alias of the previous
+                "--uninstall-batch"  => {break;} // uninstalls based on the given json file
+                "--remove-batch"  => {break;} //alias of the previous
+                "--uninstall"  => {break;}
+                "--remove"  => {break;} // alias of the previous
+                "--export"  => {break;} 
+                "--install-export"  => {break;} // same syntax as install, but instead of installing converts the argument to json and prints it
+                "--convert"  => {break;} // Converts the file from the original alternatives format to json and prints it (experimental feature, the resulting output should be reviewed and direct installation is thus not supported)
 
                     _ => {return Err(Errors::UnknownArgument);}
             }
@@ -599,8 +686,51 @@ impl Settings {
         }
         //the previous loop ended at one of the commands:
         match args[i].as_str() {
-            "--remove" => {
-                if let Some(_prio) = args.get(i+2) {
+            "--import" | "--install-batch" => {
+                let mut paths: Vec<PathBuf> = vec![];
+                loop { //there should now be a list of files to import
+                    if let Some(_) = args.get(i+1) {
+                        let path = match PathBuf::from(args[i+1].clone()).canonicalize() {
+                            Ok(p) => {p}
+                            Err(why) => {
+                                // TODO error message
+                                return Err(Errors::WrongImportArguments)
+                            }
+                        };
+                        paths.push(path); // TODO check the PathBuf::new return value
+                    }
+                    else {
+                        break; //no more arguments to parse
+                    }
+                    i+=1;
+                }
+                if paths.is_empty() == false {
+                    let rv_command = Command::Import{paths: paths};
+                    return Ok((rv_command,rv_settings.clone()));
+                } else {
+                   return Err(Errors::WrongImportArguments);
+                }
+            }
+            "--export" => {
+                let mut alts: Vec<(String,String)> = vec![];
+                loop { //there should now be a list of name identifier pairs (at least one pair)
+                    if let Some(_) = args.get(i+2) {
+                        alts.push((args[i+1].clone(),args[i+2].clone()));
+                    }
+                    else {
+                        break;
+                    }
+                    i+=2;
+                }
+                if alts.is_empty() == false {
+                    let rv_command = Command::Export{alternatives: alts};
+                    return Ok((rv_command,rv_settings.clone()));
+                } else {
+                   return Err(Errors::WrongExportArguments);
+                }
+            }
+            "--remove" | "--uninstall" => {
+                if let Some(_) = args.get(i+2) { // check there are at least 2 more arguments
                     let rv_command = Command::Remove{
                         name: args[i+1].clone(),
                         path: args[i+2].clone(),
@@ -611,8 +741,10 @@ impl Settings {
                    return Err(Errors::WrongRemoveArguments);
                 }
             }
-            "--install" => {
+            "--install" | "--install-export" => {
                 let mut alternative;// = Alternative::new();
+                // Check which variant are we actually using, before the 'i' gets modified
+                let install_export = args[i] == "--install-export";
                 //Check whether there are at least 4 more arguments (the 4th one is the priority)
                 if let Some(_prio) = args.get(i+4) {
                     
@@ -678,7 +810,13 @@ impl Settings {
                         break;
                     }
                 }
-                rv_command = Command::Install{alternative: alternative};
+                rv_command = if install_export == true
+                {
+                    Command::InstallExport{alternative: alternative}
+                }
+                else {
+                    Command::Install{alternative: alternative}
+                };
                 return Ok((rv_command,rv_settings.clone()));
 
             }
@@ -695,6 +833,7 @@ fn main() {
     let (command, env) = match Settings::parse_args(args) {
         Ok ((c,e)) => {(c,e)}
         Err (why) => {
+            // TODO pretify this
             dbg!(why);
             panic!();
         }
@@ -708,6 +847,24 @@ fn main() {
             let ops = Alternative::uninstall(&env,name,path);
             Errors::EOK
         }
+        Command::Export{alternatives} => {
+            let ops = Alternative::export_alternatives(&env,alternatives);
+            Errors::EOK
+        }
+        Command::Import{paths} => {
+            for path in paths {
+               Alternative::dropin_import(&env, path); 
+            }
+            Errors::EOK
+        }
+        Command::InstallExport{alternative} => {
+            let mut aux = vec![];
+            aux.push(alternative);
+            print!("{}",alts_to_json(&env, &aux));
+            Errors::EOK
+        }
+
+
         _ => {
             
             Errors::Unimplemented
