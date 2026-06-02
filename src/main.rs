@@ -237,8 +237,8 @@ impl Alternative {
         print_debug(_env, format!("Reading db file: {:#?}",db_file_name));
         let mut cli_alternatives = match read_db_file(_env, &db_file_name) {
             Ok(alt) => {alt}
-            Err(Errors::Json) => {return Err(Errors::Json)}
-            _ => {Vec::new()}
+            Err(Errors::DBFileNotFound) => {Vec::new()}
+            Err(err) => {return Err(err)}
         };
 
         // Check for possible conflicts
