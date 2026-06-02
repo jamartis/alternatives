@@ -61,7 +61,9 @@ enum Errors {
     AdminDirPermissions,
     AltDirPermissions,
     AlternativeAlreadyExists, //10
+    AlternativeNotFound,
     Symlink,
+    Json,
     InternalError,
     
 }
@@ -78,8 +80,10 @@ impl Errors {
             Errors::WrongArguments => {"Wrong arguments have been provided."}
             Errors::MissingArguments => {"Expected arguments have not been provided."}
             Errors::AlternativeAlreadyExists => {"The specified alternative already exists."}
+            Errors::AlternativeNotFound => {"The specified alternative has not been found."}
             Errors::Unimplemented => {"This functionality has not been implemented yet."}
             Errors::InternalError => {"Unknown internal error."}
+            Errors::Json => {"Error occured while parsing the json file."}
             _ => {"Unknown Error encountered."}
         }     
     }
@@ -166,7 +170,9 @@ impl Alternative {
 
         // Find the alternative to be removed
         let alt = match Alternative::get_alternative(_env,&alternatives, &identifier) {
-            None => {return Err(Errors::Unimplemented);}
+            None => {
+                return Err(Errors::AlternativeNotFound);
+            }
             Some(x) => {x.clone()}
         };
         print_debug(_env, format!("Found the alternative:\n{:#?}",alt));
@@ -231,6 +237,7 @@ impl Alternative {
         print_debug(_env, format!("Reading db file: {:#?}",db_file_name));
         let mut cli_alternatives = match read_db_file(_env, &db_file_name) {
             Ok(alt) => {alt}
+            Err(Errors::Json) => {return Err(Errors::Json)}
             _ => {Vec::new()}
         };
 
@@ -715,7 +722,10 @@ fn read_db_file (_env: &Settings, file_name: &PathBuf) -> Result<Vec<Alternative
     };
     
     match serde_json::from_str(&f) {
-        Err(why) => {dbg!(why); return Err(Errors::Unknown);}
+        Err(why) => {
+            print_error(_env, format!("{}",why));
+            return Err(Errors::Json);
+        }
         Ok(alts) => {rv = alts;}
     };
     for alt in rv.iter_mut() {
